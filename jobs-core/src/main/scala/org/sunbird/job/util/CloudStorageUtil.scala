@@ -41,27 +41,36 @@ class CloudStorageUtil(config: BaseJobConfig) extends Serializable {
       throw new Exception("Container name cannot be empty or blank.")
     }
     
-    // Basic validation for container name
+    // Basic validation for container name (compatible with AWS S3, Azure Blob Storage naming rules)
     if (containerName.length < 3 || containerName.length > 63) {
       throw new Exception(s"Container name '$containerName' must be between 3 and 63 characters long.")
     }
     
     // Check for valid characters (alphanumeric and hyphens, no spaces)
     if (!containerName.matches("^[a-z0-9][a-z0-9-]*[a-z0-9]$")) {
-      throw new Exception(s"Container name '$containerName' contains invalid characters. Only lowercase letters, numbers, and hyphens are allowed.")
+      throw new Exception(s"Container name '$containerName' contains invalid characters. Only lowercase letters, numbers, and hyphens are allowed. Container names must start and end with alphanumeric characters.")
     }
     
-    // Cannot start or end with hyphen
+    // Cannot start or end with hyphen (redundant check but kept for clarity)
     if (containerName.startsWith("-") || containerName.endsWith("-")) {
       throw new Exception(s"Container name '$containerName' cannot start or end with a hyphen.")
     }
+    
+    // Additional AWS S3 specific validation
+    if (containerName.contains("..") || containerName.contains(".-") || containerName.contains("-.")) {
+      throw new Exception(s"Container name '$containerName' contains invalid character patterns. Consecutive dots, dot-hyphen, or hyphen-dot combinations are not allowed.")
+    }
+    
+    logger.info(s"Container name '$containerName' passed validation for cloud storage type: $cloudStorageType")
   }
 
   def uploadFile(folderName: String, file: File, slug: Option[Boolean] = Option(true), container: String = container): Array[String] = {
     try {
+      logger.info(s"Uploading file '${file.getName}' to container '$container' in folder '$folderName' using storage type '$cloudStorageType'")
       val slugFile = if (slug.getOrElse(true)) Slug.createSlugFile(file) else file
       val objectKey = folderName + "/" + slugFile.getName
       val url = getService.upload(container, slugFile.getAbsolutePath, objectKey, Option.apply(false), Option.apply(1), Option.apply(5), Option.empty)
+      logger.info(s"Successfully uploaded file '${file.getName}' to container '$container'. Object key: '$objectKey', URL: '$url'")
       Array[String](objectKey, url)
     } catch {
       case ex: Exception =>
@@ -69,15 +78,21 @@ class CloudStorageUtil(config: BaseJobConfig) extends Serializable {
         logger.error(errorMsg, ex)
         
         // Check for specific cloud storage errors and provide better error messages
-        ex.getMessage match {
+        val exceptionMessage = Option(ex.getMessage).getOrElse("")
+        val causeMessage = Option(ex.getCause).map(_.getMessage).getOrElse("")
+        val fullMessage = s"$exceptionMessage $causeMessage"
+        
+        fullMessage match {
           case msg if msg.contains("400 Bad Request") =>
-            throw new Exception(s"$errorMsg. Container '$container' may not exist or may have invalid name format. Please verify container configuration.", ex)
+            throw new Exception(s"$errorMsg. Container '$container' may not exist or may have invalid name format. Please verify that the container/bucket '$container' exists and is accessible. Original error: ${ex.getMessage}", ex)
           case msg if msg.contains("403 Forbidden") =>
-            throw new Exception(s"$errorMsg. Access denied - please check cloud storage credentials and permissions.", ex)
+            throw new Exception(s"$errorMsg. Access denied - please check cloud storage credentials and permissions for container '$container'. Original error: ${ex.getMessage}", ex)
           case msg if msg.contains("404 Not Found") =>
-            throw new Exception(s"$errorMsg. Container '$container' not found. Please verify container exists.", ex)
+            throw new Exception(s"$errorMsg. Container '$container' not found. Please verify the container exists and the endpoint configuration is correct. Original error: ${ex.getMessage}", ex)
+          case msg if msg.contains("containerExists") || msg.contains("bucketExists") =>
+            throw new Exception(s"$errorMsg. Failed to verify if container '$container' exists. This could indicate: 1) Container doesn't exist, 2) Insufficient permissions, 3) Network connectivity issues, or 4) Incorrect cloud storage endpoint configuration. Please verify your cloud storage configuration. Original error: ${ex.getMessage}", ex)
           case _ =>
-            throw new Exception(errorMsg, ex)
+            throw new Exception(s"$errorMsg. Please check cloud storage configuration and network connectivity. Original error: ${ex.getMessage}", ex)
         }
     }
   }
